@@ -374,6 +374,7 @@ class _SM90GDNPrefillReferenceKernel:
         self,
         kk_tile: cute.Tensor,
         inv_kk_beta_tile: cute.Tensor,
+        mma_scratch_tile: cute.Tensor,
         chunk_start,
         seq_end,
         tidx,
@@ -382,7 +383,14 @@ class _SM90GDNPrefillReferenceKernel:
 
         cute.arch.barrier()
 
-        self._stage_kk_lower_blocks_inv_reference(kk_tile, inv_kk_beta_tile, chunk_start, seq_end, tidx)
+        self._stage_kk_lower_blocks_inv_reference(
+            kk_tile,
+            inv_kk_beta_tile,
+            mma_scratch_tile,
+            chunk_start,
+            seq_end,
+            tidx,
+        )
 
     @cute.jit
     def _stage_kk_diagonal_8x8_inv_reference(
@@ -394,31 +402,50 @@ class _SM90GDNPrefillReferenceKernel:
         tidx,
     ):
         if tidx < self.chunk_size:
-            col = tidx
-            block_idx = col // 8
+            block_idx = tidx // 8
+            local_row = tidx - block_idx * 8
             block_start = block_idx * 8
-            local_col = col - block_start
-            for local_row in cutlass.range(0, 8, unroll=0):
-                row = block_start + local_row
-                token_row = chunk_start + row
+            row = block_start + local_row
+            token_row = chunk_start + row
+            for local_col in cutlass.range(0, 8, unroll=0):
+                col = block_start + local_col
                 value = cutlass.Float32(0.0)
-                if token_row < seq_end and local_col <= local_row:
+                if token_row < seq_end:
                     if local_col == local_row:
                         value = cutlass.Float32(1.0)
-                    else:
-                        acc = cutlass.Float32(0.0)
-                        for local_mid in cutlass.range(0, 8, unroll=0):
-                            mid = block_start + local_mid
-                            if local_col <= local_mid and local_mid < local_row:
-                                acc += kk_tile[row, mid] * inv_kk_beta_tile[mid, col]
-                        value = -acc
+                    elif local_col < local_row:
+                        value = kk_tile[row, col]
                 inv_kk_beta_tile[row, col] = value
+
+        cute.arch.barrier()
+
+        for src_local_row in cutlass.range(0, 7, unroll=0):
+            if tidx < self.chunk_size:
+                block_idx = tidx // 8
+                local_row = tidx - block_idx * 8
+                block_start = block_idx * 8
+                row = block_start + local_row
+                token_row = chunk_start + row
+                if token_row < seq_end and local_row > src_local_row:
+                    pivot_col = block_start + src_local_row
+                    row_scale = -inv_kk_beta_tile[row, pivot_col]
+                    for local_col in cutlass.range(0, 8, unroll=0):
+                        if local_col < src_local_row:
+                            col = block_start + local_col
+                            inv_kk_beta_tile[row, col] = (
+                                row_scale * inv_kk_beta_tile[block_start + src_local_row, col]
+                                + inv_kk_beta_tile[row, col]
+                            )
+                    inv_kk_beta_tile[row, pivot_col] = row_scale
+
+            cute.arch.barrier()
 
     @cute.jit
     def _stage_kk_lower_blocks_inv_reference(
         self,
         kk_tile: cute.Tensor,
         inv_kk_beta_tile: cute.Tensor,
+        mma_scratch_tile: cute.Tensor,
         chunk_start,
         seq_end,
         tidx,
@@ -428,6 +455,7 @@ class _SM90GDNPrefillReferenceKernel:
                 self._stage_kk_lower_8x8_block_inv_reference(
                     kk_tile,
                     inv_kk_beta_tile,
+                    mma_scratch_tile,
                     row_block,
                     col_block,
                     chunk_start,
@@ -442,6 +470,7 @@ class _SM90GDNPrefillReferenceKernel:
         self,
         kk_tile: cute.Tensor,
         inv_kk_beta_tile: cute.Tensor,
+        mma_scratch_tile: cute.Tensor,
         row_block,
         col_block,
         chunk_start,
@@ -454,31 +483,259 @@ class _SM90GDNPrefillReferenceKernel:
         col_block_start = col_block * 8
         col = col_block_start + local_col
 
-        for solve_local_row in cutlass.range(0, 8, unroll=0):
-            if tidx < self.chunk_size and local_row == solve_local_row:
-                row = row_block_start + local_row
-                token_row = chunk_start + row
-                value = cutlass.Float32(0.0)
-                if token_row < seq_end:
-                    c_inv_a_acc = cutlass.Float32(0.0)
-                    for dep_block in cutlass.range(0, row_block, unroll=0):
-                        dep_block_start = dep_block * 8
-                        for local_mid in cutlass.range(0, 8, unroll=0):
-                            mid = dep_block_start + local_mid
-                            if col <= mid:
-                                c_inv_a_acc += kk_tile[row, mid] * inv_kk_beta_tile[mid, col]
+        self._stage_kk_lower_8x8_c_inv_a_reference(
+            kk_tile,
+            inv_kk_beta_tile,
+            mma_scratch_tile,
+            row_block,
+            col_block,
+            chunk_start,
+            seq_end,
+            tidx,
+        )
 
-                    diagonal_block_acc = cutlass.Float32(0.0)
-                    for local_mid in cutlass.range(0, 8, unroll=0):
-                        if local_mid < local_row:
-                            mid = row_block_start + local_mid
-                            diagonal_block_acc += kk_tile[row, mid] * inv_kk_beta_tile[mid, col]
+        cute.arch.barrier()
 
-                    value = -(c_inv_a_acc + diagonal_block_acc)
+        self._stage_kk_lower_8x8_inv_d_apply_reference(
+            kk_tile,
+            inv_kk_beta_tile,
+            mma_scratch_tile,
+            row_block_start,
+            col_block_start,
+            chunk_start,
+            seq_end,
+            tidx,
+        )
 
-                inv_kk_beta_tile[row, col] = value
+    @cute.jit
+    def _stage_kk_lower_8x8_c_inv_a_reference(
+        self,
+        kk_tile: cute.Tensor,
+        inv_kk_beta_tile: cute.Tensor,
+        mma_scratch_tile: cute.Tensor,
+        row_block,
+        col_block,
+        chunk_start,
+        seq_end,
+        tidx,
+    ):
+        local_row = tidx // 8
+        local_col = tidx - local_row * 8
+        row = row_block * 8 + local_row
+        col = col_block * 8 + local_col
 
-            cute.arch.barrier()
+        if tidx < self.chunk_size:
+            inv_kk_beta_tile[row, col] = cutlass.Float32(0.0)
+
+        cute.arch.barrier()
+
+        for dep_block in cutlass.range(0, row_block, unroll=0):
+            self._stage_kk_lower_8x8_c_inv_a_dep_block_reference(
+                kk_tile,
+                inv_kk_beta_tile,
+                mma_scratch_tile,
+                row_block,
+                dep_block,
+                col_block,
+                chunk_start,
+                seq_end,
+                tidx,
+            )
+
+    @cute.jit
+    def _stage_kk_lower_8x8_c_inv_a_dep_block_reference(
+        self,
+        kk_tile: cute.Tensor,
+        inv_kk_beta_tile: cute.Tensor,
+        mma_scratch_tile: cute.Tensor,
+        row_block,
+        dep_block,
+        col_block,
+        chunk_start,
+        seq_end,
+        tidx,
+    ):
+        lane_id = cute.arch.thread_idx()[0] % 32
+        warp_idx = cute.arch.warp_idx() % 4
+
+        scratch_iters = (16 * 32 + self.threads_per_cta - 1) // self.threads_per_cta
+        for scratch_iter in cutlass.range(0, scratch_iters, unroll=0):
+            scratch_idx = scratch_iter * self.threads_per_cta + tidx
+            if scratch_idx < 16 * 32:
+                scratch_row = scratch_idx // 32
+                scratch_col = scratch_idx - scratch_row * 32
+                value = cutlass.BFloat16(0.0)
+                if scratch_col < 16:
+                    if scratch_row < 8 and scratch_col < 8:
+                        row = row_block * 8 + scratch_row
+                        token_row = chunk_start + row
+                        if token_row < seq_end:
+                            value = cutlass.BFloat16(kk_tile[row, dep_block * 8 + scratch_col])
+                    mma_scratch_tile[scratch_row, scratch_col] = value
+                else:
+                    b_col = scratch_col - 16
+                    if scratch_row < 8 and b_col < 8:
+                        value = cutlass.BFloat16(
+                            inv_kk_beta_tile[dep_block * 8 + b_col, col_block * 8 + scratch_row]
+                        )
+                    mma_scratch_tile[scratch_row, scratch_col] = value
+
+        cute.arch.barrier()
+
+        if warp_idx == 0:
+            mma_atom = cute.nvgpu.warp.MmaF16BF16Op(
+                ab_dtype=cutlass.BFloat16,
+                acc_dtype=cutlass.Float32,
+                shape_mnk=(16, 8, 16),
+            )
+            tiled_mma = cute.make_tiled_mma(
+                mma_atom,
+                atom_layout_mnk=(1, 1, 1),
+                permutation_mnk=(16, 16, 16),
+            )
+            thr_mma = tiled_mma.get_slice(lane_id)
+
+            copy_atom = cute.make_copy_atom(
+                cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+                cutlass.BFloat16,
+            )
+            a_tiled_copy = cute.make_tiled_copy_A(copy_atom, tiled_mma)
+            b_tiled_copy = cute.make_tiled_copy_B(copy_atom, tiled_mma)
+            a_thr_copy = a_tiled_copy.get_slice(lane_id)
+            b_thr_copy = b_tiled_copy.get_slice(lane_id)
+
+            scratch_layout = cute.make_layout(
+                (16, 16),
+                stride=(self.head_size, 1),
+            )
+            a_scratch = cute.make_tensor(
+                mma_scratch_tile.iterator,
+                layout=scratch_layout,
+            )
+            b_scratch = cute.make_tensor(
+                mma_scratch_tile.iterator + 16,
+                layout=scratch_layout,
+            )
+
+            t_a = thr_mma.make_fragment_A(thr_mma.partition_A(a_scratch))
+            t_b = thr_mma.make_fragment_B(thr_mma.partition_B(b_scratch))
+
+            cute.copy(a_tiled_copy, a_thr_copy.partition_S(a_scratch), a_thr_copy.retile(t_a))
+            cute.copy(b_tiled_copy, b_thr_copy.partition_S(b_scratch), b_thr_copy.retile(t_b))
+
+            t_out = tiled_mma.make_fragment_C(tiled_mma.partition_shape_C((16, 16)))
+            t_out.fill(0.0)
+            cute.gemm(tiled_mma, t_out, t_a, t_b, t_out)
+
+            out_coord = cute.make_identity_tensor((16, 16))
+            t_out_coord = thr_mma.partition_C(out_coord)
+            for i in cutlass.range_constexpr(cute.size(t_out_coord)):
+                local_row, local_col = t_out_coord[i]
+                if local_row < 8 and local_col < 8:
+                    row = row_block * 8 + local_row
+                    token_row = chunk_start + row
+                    if token_row < seq_end:
+                        col = col_block * 8 + local_col
+                        inv_kk_beta_tile[row, col] = inv_kk_beta_tile[row, col] + t_out[i]
+
+        cute.arch.barrier()
+
+    @cute.jit
+    def _stage_kk_lower_8x8_inv_d_apply_reference(
+        self,
+        kk_tile: cute.Tensor,
+        inv_kk_beta_tile: cute.Tensor,
+        mma_scratch_tile: cute.Tensor,
+        row_block_start,
+        col_block_start,
+        chunk_start,
+        seq_end,
+        tidx,
+    ):
+        lane_id = cute.arch.thread_idx()[0] % 32
+        warp_idx = cute.arch.warp_idx() % 4
+
+        scratch_iters = (16 * 32 + self.threads_per_cta - 1) // self.threads_per_cta
+        for scratch_iter in cutlass.range(0, scratch_iters, unroll=0):
+            scratch_idx = scratch_iter * self.threads_per_cta + tidx
+            if scratch_idx < 16 * 32:
+                scratch_row = scratch_idx // 32
+                scratch_col = scratch_idx - scratch_row * 32
+                value = cutlass.BFloat16(0.0)
+                if scratch_col < 16:
+                    if scratch_row < 8 and scratch_col < 8:
+                        value = cutlass.BFloat16(
+                            inv_kk_beta_tile[row_block_start + scratch_row, row_block_start + scratch_col]
+                        )
+                    mma_scratch_tile[scratch_row, scratch_col] = value
+                else:
+                    b_col = scratch_col - 16
+                    if scratch_row < 8 and b_col < 8:
+                        value = cutlass.BFloat16(
+                            inv_kk_beta_tile[row_block_start + b_col, col_block_start + scratch_row]
+                        )
+                    mma_scratch_tile[scratch_row, scratch_col] = value
+
+        cute.arch.barrier()
+
+        if warp_idx == 0:
+            mma_atom = cute.nvgpu.warp.MmaF16BF16Op(
+                ab_dtype=cutlass.BFloat16,
+                acc_dtype=cutlass.Float32,
+                shape_mnk=(16, 8, 16),
+            )
+            tiled_mma = cute.make_tiled_mma(
+                mma_atom,
+                atom_layout_mnk=(1, 1, 1),
+                permutation_mnk=(16, 16, 16),
+            )
+            thr_mma = tiled_mma.get_slice(lane_id)
+
+            copy_atom = cute.make_copy_atom(
+                cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+                cutlass.BFloat16,
+            )
+            a_tiled_copy = cute.make_tiled_copy_A(copy_atom, tiled_mma)
+            b_tiled_copy = cute.make_tiled_copy_B(copy_atom, tiled_mma)
+            a_thr_copy = a_tiled_copy.get_slice(lane_id)
+            b_thr_copy = b_tiled_copy.get_slice(lane_id)
+
+            scratch_layout = cute.make_layout(
+                (16, 16),
+                stride=(self.head_size, 1),
+            )
+            a_scratch = cute.make_tensor(
+                mma_scratch_tile.iterator,
+                layout=scratch_layout,
+            )
+            b_scratch = cute.make_tensor(
+                mma_scratch_tile.iterator + 16,
+                layout=scratch_layout,
+            )
+
+            t_a = thr_mma.make_fragment_A(thr_mma.partition_A(a_scratch))
+            t_b = thr_mma.make_fragment_B(thr_mma.partition_B(b_scratch))
+
+            cute.copy(a_tiled_copy, a_thr_copy.partition_S(a_scratch), a_thr_copy.retile(t_a))
+            cute.copy(b_tiled_copy, b_thr_copy.partition_S(b_scratch), b_thr_copy.retile(t_b))
+
+            t_out = tiled_mma.make_fragment_C(tiled_mma.partition_shape_C((16, 16)))
+            t_out.fill(0.0)
+            cute.gemm(tiled_mma, t_out, t_a, t_b, t_out)
+
+            out_coord = cute.make_identity_tensor((16, 16))
+            t_out_coord = thr_mma.partition_C(out_coord)
+            for i in cutlass.range_constexpr(cute.size(t_out_coord)):
+                local_row, local_col = t_out_coord[i]
+                if local_row < 8 and local_col < 8:
+                    row = row_block_start + local_row
+                    token_row = chunk_start + row
+                    value = cutlass.Float32(0.0)
+                    if token_row < seq_end:
+                        value = -t_out[i]
+                    inv_kk_beta_tile[row, col_block_start + local_col] = value
+
+        cute.arch.barrier()
 
     @cute.jit
     def _stage_apply_inv_kk_beta_reference(
@@ -534,6 +791,7 @@ class _SM90GDNPrefillReferenceKernel:
         self._stage_kk_store_and_inv_reference(
             kk_tile,
             inv_kk_beta_tile,
+            inv_kk_beta_bf16_tile,
             chunk_start,
             seq_end,
             tidx,
