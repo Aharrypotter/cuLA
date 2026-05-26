@@ -199,6 +199,7 @@ class _SM90GDNPrefillReferenceKernel:
         v_tile = smem.allocate_tensor(cutlass.BFloat16, qkv_tile_layout, 16)
         new_v_tile = smem.allocate_tensor(cutlass.BFloat16, qkv_tile_layout, 16)
         intra_out_tile = smem.allocate_tensor(cutlass.BFloat16, qkv_tile_layout, 16)
+        old_output_tile = smem.allocate_tensor(cutlass.BFloat16, qkv_tile_layout, 16)
         gate_tile = smem.allocate_tensor(cutlass.Float32, gate_tile_layout, 16)
         beta_tile = smem.allocate_tensor(cutlass.Float32, gate_tile_layout, 16)
         cumprod_tile = smem.allocate_tensor(cutlass.Float32, gate_tile_layout, 16)
@@ -206,9 +207,8 @@ class _SM90GDNPrefillReferenceKernel:
         qk_tile = smem.allocate_tensor(cutlass.Float32, score_tile_layout, 16)
         kk_tile = smem.allocate_tensor(cutlass.Float32, score_tile_layout, 16)
         inv_kk_beta_tile = smem.allocate_tensor(cutlass.Float32, score_tile_layout, 16)
-        # Reuse existing bf16 tiles for projection staging to avoid pushing SMEM past
-        # the SM90 per-CTA limit before the MMA/TMA rewrite.
-        qs_tile = v_tile
+        # Reuse an existing bf16 tile for inverse-KK and projection scratch while
+        # keeping old-output staging independent from the residual V lifetime.
         inv_kk_beta_bf16_tile = intra_out_tile
 
         self._load_initial_state_reference(initial_state, state, seq_idx, head_idx, v_col)
@@ -266,11 +266,12 @@ class _SM90GDNPrefillReferenceKernel:
                 v_tile,
                 state,
                 qk_tile,
-                qs_tile,
+                old_output_tile,
                 intra_out_tile,
                 new_v_tile,
                 cumprod_tile,
                 decay_tile,
+                seq_start,
                 chunk_start,
                 seq_end,
                 head_idx,
@@ -823,14 +824,46 @@ class _SM90GDNPrefillReferenceKernel:
                     qk_bf16_tile[tile_row, v_col] = cutlass.BFloat16(0.0)
 
     @cute.jit
-    def _store_output_and_decay_new_v_reference(
+    def _stage_output_tile_reference(
+        self,
+        output_tile: cute.Tensor,
+        intra_out_tile: cute.Tensor,
+        chunk_start,
+        seq_end,
+        v_col,
+    ):
+        for tile_row in cutlass.range(0, self.chunk_size, unroll=0):
+            token_idx = chunk_start + tile_row
+            if token_idx < seq_end and v_col < self.head_size:
+                output_tile[tile_row, v_col] = cutlass.BFloat16(
+                    cutlass.Float32(output_tile[tile_row, v_col]) + cutlass.Float32(intra_out_tile[tile_row, v_col])
+                )
+            elif v_col < self.head_size:
+                output_tile[tile_row, v_col] = cutlass.BFloat16(0.0)
+
+    @cute.jit
+    def _stage_decay_new_value_reference(
+        self,
+        new_v_tile: cute.Tensor,
+        decay_tile: cute.Tensor,
+        chunk_start,
+        seq_end,
+        v_col,
+    ):
+        for tile_row in cutlass.range(0, self.chunk_size, unroll=0):
+            token_idx = chunk_start + tile_row
+            if token_idx < seq_end and v_col < self.head_size:
+                new_v_tile[tile_row, v_col] = cutlass.BFloat16(
+                    decay_tile[tile_row] * cutlass.Float32(new_v_tile[tile_row, v_col])
+                )
+            elif v_col < self.head_size:
+                new_v_tile[tile_row, v_col] = cutlass.BFloat16(0.0)
+
+    @cute.jit
+    def _store_output_reference(
         self,
         output: cute.Tensor,
-        qs_tile: cute.Tensor,
-        intra_out_tile: cute.Tensor,
-        new_v_tile: cute.Tensor,
-        cumprod_tile: cute.Tensor,
-        decay_tile: cute.Tensor,
+        output_tile: cute.Tensor,
         chunk_start,
         seq_end,
         head_idx,
@@ -839,18 +872,7 @@ class _SM90GDNPrefillReferenceKernel:
         for tile_row in cutlass.range(0, self.chunk_size, unroll=0):
             token_idx = chunk_start + tile_row
             if token_idx < seq_end and v_col < self.head_size:
-                output[token_idx, head_idx, v_col] = cutlass.BFloat16(
-                    (
-                        cumprod_tile[tile_row] * cutlass.Float32(qs_tile[tile_row, v_col])
-                        + cutlass.Float32(intra_out_tile[tile_row, v_col])
-                    )
-                    * self.scale
-                )
-                new_v_tile[tile_row, v_col] = cutlass.BFloat16(
-                    decay_tile[tile_row] * cutlass.Float32(new_v_tile[tile_row, v_col])
-                )
-            elif v_col < self.head_size:
-                new_v_tile[tile_row, v_col] = cutlass.BFloat16(0.0)
+                output[token_idx, head_idx, v_col] = output_tile[tile_row, v_col]
 
     @cute.jit
     def _compute_state_reference(
@@ -861,71 +883,267 @@ class _SM90GDNPrefillReferenceKernel:
         residual_tile: cute.Tensor,
         state: cute.Tensor,
         qk_tile: cute.Tensor,
-        qs_tile: cute.Tensor,
+        old_output_tile: cute.Tensor,
         intra_out_tile: cute.Tensor,
         new_v_tile: cute.Tensor,
         cumprod_tile: cute.Tensor,
         decay_tile: cute.Tensor,
+        seq_start,
         chunk_start,
         seq_end,
         head_idx,
         v_col,
     ):
-        self._stage_residual_mma_16x16(
+        self._stage_old_output_reference(
+            q_tile,
+            state,
+            new_v_tile,
+            old_output_tile,
+            cumprod_tile,
+            seq_start,
+            chunk_start,
+            seq_end,
+            v_col,
+        )
+
+        self._stage_residual_reference(
             k_tile,
             state,
+            q_tile,
             new_v_tile,
             residual_tile,
             cumprod_tile,
+            seq_start,
             chunk_start,
             seq_end,
         )
 
-        cute.arch.barrier()
+        self._stage_new_value_reference(intra_out_tile, residual_tile, new_v_tile)
 
-        self._stage_new_v_mma_16x16(intra_out_tile, residual_tile, new_v_tile)
+        self._stage_intra_output_reference(qk_tile, q_tile, new_v_tile, intra_out_tile, v_col)
 
-        cute.arch.barrier()
-
-        self._stage_state_projection_mma_16x16(q_tile, state, intra_out_tile, qs_tile)
-
-        cute.arch.barrier()
-
-        self._stage_qk_for_intra_output_reference(qk_tile, q_tile, v_col)
-
-        cute.arch.barrier()
-
-        self._stage_intra_out_mma_16x16(q_tile, new_v_tile, intra_out_tile)
-
-        cute.arch.barrier()
-
-        self._store_output_and_decay_new_v_reference(
-            output,
-            qs_tile,
+        self._stage_output_reference(
+            old_output_tile,
             intra_out_tile,
-            new_v_tile,
-            cumprod_tile,
-            decay_tile,
             chunk_start,
             seq_end,
-            head_idx,
+            v_col,
+        )
+
+        self._stage_store_output_reference(output, old_output_tile, chunk_start, seq_end, head_idx, v_col)
+
+        self._stage_decay_new_value_reference(new_v_tile, decay_tile, chunk_start, seq_end, v_col)
+
+        cute.arch.barrier()
+
+        self._stage_update_state_reference(q_tile, k_tile, new_v_tile, state, cumprod_tile)
+
+    @cute.jit
+    def _stage_residual_reference(
+        self,
+        k_tile: cute.Tensor,
+        state: cute.Tensor,
+        state_scratch_tile: cute.Tensor,
+        state_key_tile: cute.Tensor,
+        residual_tile: cute.Tensor,
+        cumprod_tile: cute.Tensor,
+        seq_start,
+        chunk_start,
+        seq_end,
+    ):
+        if cutlass.const_expr(not self.use_initial_state):
+            if chunk_start != seq_start:
+                self._stage_state_key_projection_mma_16x16(
+                    k_tile,
+                    state,
+                    state_scratch_tile,
+                    state_key_tile,
+                    chunk_start,
+                    seq_end,
+                )
+
+                cute.arch.barrier()
+
+                self._stage_residual_from_state_key_reference(
+                    state_key_tile,
+                    residual_tile,
+                    cumprod_tile,
+                    chunk_start,
+                    seq_end,
+                )
+        else:
+            self._stage_state_key_projection_mma_16x16(
+                k_tile,
+                state,
+                state_scratch_tile,
+                state_key_tile,
+                chunk_start,
+                seq_end,
+            )
+
+            cute.arch.barrier()
+
+            self._stage_residual_from_state_key_reference(
+                state_key_tile,
+                residual_tile,
+                cumprod_tile,
+                chunk_start,
+                seq_end,
+            )
+
+        cute.arch.barrier()
+
+    @cute.jit
+    def _stage_new_value_reference(
+        self,
+        inv_kk_beta_bf16_tile: cute.Tensor,
+        residual_tile: cute.Tensor,
+        new_v_tile: cute.Tensor,
+    ):
+        self._stage_new_v_mma_16x16(inv_kk_beta_bf16_tile, residual_tile, new_v_tile)
+
+        cute.arch.barrier()
+
+    @cute.jit
+    def _stage_old_output_reference(
+        self,
+        q_tile: cute.Tensor,
+        state: cute.Tensor,
+        state_scratch_tile: cute.Tensor,
+        old_output_tile: cute.Tensor,
+        cumprod_tile: cute.Tensor,
+        seq_start,
+        chunk_start,
+        seq_end,
+        v_col,
+    ):
+        if cutlass.const_expr(not self.use_initial_state):
+            if chunk_start == seq_start:
+                self._stage_zero_old_state_projection_reference(old_output_tile, v_col)
+            else:
+                self._stage_state_projection_mma_16x16(q_tile, state, state_scratch_tile, old_output_tile)
+        else:
+            self._stage_state_projection_mma_16x16(q_tile, state, state_scratch_tile, old_output_tile)
+
+        cute.arch.barrier()
+
+        self._stage_scale_old_output_reference(old_output_tile, cumprod_tile, chunk_start, seq_end, v_col)
+
+        cute.arch.barrier()
+
+    @cute.jit
+    def _stage_intra_output_reference(
+        self,
+        qk_tile: cute.Tensor,
+        qk_bf16_tile: cute.Tensor,
+        new_v_tile: cute.Tensor,
+        intra_out_tile: cute.Tensor,
+        v_col,
+    ):
+        self._stage_qk_for_intra_output_reference(qk_tile, qk_bf16_tile, v_col)
+
+        cute.arch.barrier()
+
+        self._stage_intra_out_mma_16x16(qk_bf16_tile, new_v_tile, intra_out_tile)
+
+        cute.arch.barrier()
+
+    @cute.jit
+    def _stage_output_reference(
+        self,
+        output_tile: cute.Tensor,
+        intra_out_tile: cute.Tensor,
+        chunk_start,
+        seq_end,
+        v_col,
+    ):
+        self._stage_output_tile_reference(
+            output_tile,
+            intra_out_tile,
+            chunk_start,
+            seq_end,
             v_col,
         )
 
         cute.arch.barrier()
 
-        self._stage_state_update_mma_16x16(q_tile, k_tile, new_v_tile, state, cumprod_tile)
+    @cute.jit
+    def _stage_store_output_reference(
+        self,
+        output: cute.Tensor,
+        output_tile: cute.Tensor,
+        chunk_start,
+        seq_end,
+        head_idx,
+        v_col,
+    ):
+        self._store_output_reference(output, output_tile, chunk_start, seq_end, head_idx, v_col)
 
         cute.arch.barrier()
 
     @cute.jit
-    def _stage_residual_mma_16x16(
+    def _stage_update_state_reference(
+        self,
+        scratch_tile: cute.Tensor,
+        k_tile: cute.Tensor,
+        decayed_new_v_tile: cute.Tensor,
+        state: cute.Tensor,
+        cumprod_tile: cute.Tensor,
+    ):
+        self._stage_scale_state_reference(state, cumprod_tile)
+
+        cute.arch.barrier()
+
+        self._stage_state_update_mma_16x16(scratch_tile, k_tile, decayed_new_v_tile, state)
+
+        cute.arch.barrier()
+
+    @cute.jit
+    def _stage_scale_state_reference(
+        self,
+        state: cute.Tensor,
+        cumprod_tile: cute.Tensor,
+    ):
+        v_col = cute.arch.thread_idx()[0]
+        if v_col < self.head_size:
+            for k_row in cutlass.range(self.head_size, unroll=1):
+                state[k_row, v_col] = cumprod_tile[self.chunk_size - 1] * state[k_row, v_col]
+
+    @cute.jit
+    def _stage_zero_old_state_projection_reference(
+        self,
+        old_output_tile: cute.Tensor,
+        v_col,
+    ):
+        if v_col < self.head_size:
+            for tile_row in cutlass.range(0, self.chunk_size, unroll=0):
+                old_output_tile[tile_row, v_col] = cutlass.BFloat16(0.0)
+
+    @cute.jit
+    def _stage_scale_old_output_reference(
+        self,
+        old_output_tile: cute.Tensor,
+        cumprod_tile: cute.Tensor,
+        chunk_start,
+        seq_end,
+        v_col,
+    ):
+        for tile_row in cutlass.range(0, self.chunk_size, unroll=0):
+            token_idx = chunk_start + tile_row
+            if token_idx < seq_end and v_col < self.head_size:
+                old_output_tile[tile_row, v_col] = cutlass.BFloat16(
+                    cumprod_tile[tile_row] * self.scale * cutlass.Float32(old_output_tile[tile_row, v_col])
+                )
+            elif v_col < self.head_size:
+                old_output_tile[tile_row, v_col] = cutlass.BFloat16(0.0)
+
+    @cute.jit
+    def _stage_state_key_projection_mma_16x16(
         self,
         k_tile: cute.Tensor,
         state: cute.Tensor,
         state_scratch_tile: cute.Tensor,
-        residual_tile: cute.Tensor,
-        cumprod_tile: cute.Tensor,
+        state_key_tile: cute.Tensor,
         chunk_start,
         seq_end,
     ):
@@ -997,14 +1215,31 @@ class _SM90GDNPrefillReferenceKernel:
                 row, col = t_out_coord[i]
                 token_idx = chunk_start + row_base + row
                 if token_idx < seq_end:
-                    residual_tile[row_base + row, col_base + col] = cutlass.BFloat16(
-                        cutlass.Float32(residual_tile[row_base + row, col_base + col])
-                        - cumprod_tile[row_base + row] * t_out[i]
-                    )
+                    state_key_tile[row_base + row, col_base + col] = cutlass.BFloat16(t_out[i])
                 else:
-                    residual_tile[row_base + row, col_base + col] = cutlass.BFloat16(0.0)
+                    state_key_tile[row_base + row, col_base + col] = cutlass.BFloat16(0.0)
 
             cute.arch.barrier()
+
+    @cute.jit
+    def _stage_residual_from_state_key_reference(
+        self,
+        state_key_tile: cute.Tensor,
+        residual_tile: cute.Tensor,
+        cumprod_tile: cute.Tensor,
+        chunk_start,
+        seq_end,
+    ):
+        v_col = cute.arch.thread_idx()[0]
+        for tile_row in cutlass.range(0, self.chunk_size, unroll=0):
+            token_idx = chunk_start + tile_row
+            if token_idx < seq_end and v_col < self.head_size:
+                residual_tile[tile_row, v_col] = cutlass.BFloat16(
+                    cutlass.Float32(residual_tile[tile_row, v_col])
+                    - cumprod_tile[tile_row] * cutlass.Float32(state_key_tile[tile_row, v_col])
+                )
+            elif v_col < self.head_size:
+                residual_tile[tile_row, v_col] = cutlass.BFloat16(0.0)
 
     @cute.jit
     def _stage_raw_qk_kk_scores_mma_16x16(
@@ -1334,7 +1569,6 @@ class _SM90GDNPrefillReferenceKernel:
         k_tile: cute.Tensor,
         decayed_new_v_tile: cute.Tensor,
         state: cute.Tensor,
-        cumprod_tile: cute.Tensor,
     ):
         warp_idx = cute.arch.warp_idx() % 4
         lane_id = cute.arch.thread_idx()[0] % 32
@@ -1396,9 +1630,7 @@ class _SM90GDNPrefillReferenceKernel:
 
             for i in cutlass.range_constexpr(cute.size(t_state_coord)):
                 row, col = t_state_coord[i]
-                state[row_base + row, col_base + col] = (
-                    cumprod_tile[self.chunk_size - 1] * state[row_base + row, col_base + col] + t_state[i]
-                )
+                state[row_base + row, col_base + col] = state[row_base + row, col_base + col] + t_state[i]
 
             cute.arch.barrier()
 
@@ -1420,7 +1652,7 @@ class _SM90GDNPrefillReferenceKernel:
                 for col in cutlass.range(0, row + 1, unroll=0):
                     transfer = cutlass.Float32(0.0)
                     transfer = cumprod_tile[row] / cumprod_tile[col]
-                    qk_tile[row, col] = transfer * qk_tile[row, col]
+                    qk_tile[row, col] = self.scale * transfer * qk_tile[row, col]
                     kk_tile[row, col] = (
                         beta_tile[row] * transfer * kk_tile[row, col] if col < row else cutlass.Float32(0.0)
                     )
