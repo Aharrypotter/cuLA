@@ -12,9 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from cula.gdn.blackwell_fused_fwd import chunk_gated_delta_rule, is_sm100_gdn_prefill_available
+from cula.gdn.blackwell_fused_fwd import (
+    chunk_gated_delta_rule,
+    get_sm90_gdn_prefill_backend,
+    is_sm90_gdn_prefill_dsl_available,
+    is_sm90_gdn_prefill_available,
+    is_sm100_gdn_prefill_available,
+)
 
 __all__ = [
     "chunk_gated_delta_rule",
+    "get_sm90_gdn_prefill_backend",
+    "is_sm90_gdn_prefill_dsl_available",
+    "is_sm90_gdn_prefill_available",
     "is_sm100_gdn_prefill_available",
 ]

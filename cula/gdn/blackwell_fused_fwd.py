@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import functools
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional, Union
 
@@ -31,6 +32,9 @@ import torch
 
 __all__ = [
     "chunk_gated_delta_rule",
+    "get_sm90_gdn_prefill_backend",
+    "is_sm90_gdn_prefill_dsl_available",
+    "is_sm90_gdn_prefill_available",
     "is_sm100_gdn_prefill_available",
 ]
 
@@ -39,6 +43,9 @@ _SUPPORTED_STATE_DTYPES = (torch.float32,)
 _HEAD_SIZE = 128
 _CHUNK_SIZE = 64
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 2"
+_SM90_BACKEND_ENV = "CULA_GDN_SM90_BACKEND"
+_SM90_BACKEND_CUTLASS = "cutlass"
+_SM90_BACKEND_DSL = "dsl"
 
 
 @dataclass(frozen=True)
@@ -89,6 +96,34 @@ def is_sm100_gdn_prefill_available(device: torch.device | int | str | None = Non
         device = torch.cuda.current_device()
     props = torch.cuda.get_device_properties(device)
     return props.major == 10 and props.minor in (0, 3)
+
+
+def is_sm90_gdn_prefill_available(device: torch.device | int | str | None = None) -> bool:
+    """Return whether the current device can run the SM90 GDN prefill path."""
+    if not torch.cuda.is_available():
+        return False
+    if device is None:
+        device = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device)
+    return props.major == 9 and props.minor == 0
+
+
+def is_sm90_gdn_prefill_dsl_available(device: torch.device | int | str | None = None) -> bool:
+    """Return whether the current environment can attempt the SM90 DSL path."""
+    from cula.gdn.sm90_dsl_fwd import is_sm90_gdn_prefill_dsl_available as _available
+
+    return _available(device)
+
+
+def get_sm90_gdn_prefill_backend() -> str:
+    """Return the selected SM90 backend: ``cutlass`` or ``dsl``."""
+    backend = os.getenv(_SM90_BACKEND_ENV, _SM90_BACKEND_CUTLASS).strip().lower()
+    if backend not in (_SM90_BACKEND_CUTLASS, _SM90_BACKEND_DSL):
+        raise ValueError(
+            f"{_SM90_BACKEND_ENV} must be one of "
+            f"{_SM90_BACKEND_CUTLASS!r}, {_SM90_BACKEND_DSL!r}; got {backend!r}"
+        )
+    return backend
 
 
 def _cutlass_io_dtype(torch_dtype: torch.dtype):
@@ -456,6 +491,56 @@ def _launch_sm100_gdn_prefill(inputs: _GDNPrefillInputs) -> None:
     )
 
 
+def _launch_sm90_gdn_prefill(inputs: _GDNPrefillInputs) -> None:
+    import cula.cudac as cula_cuda
+
+    from cula.utils import _get_cache_buf, assert_hopper, get_device_sm_count
+
+    assert_hopper(inputs.q.device)
+
+    q = inputs.q
+    k = inputs.k
+    v = inputs.v
+    output = inputs.output
+    initial_state = inputs.initial_state
+    output_state = inputs.output_state
+
+    # FlashInfer's SM90 flat GDN kernel uses int64 cumulative lengths.
+    cu_seqlens_i64 = inputs.cu_seqlens_i32.to(torch.int64)
+    if not cu_seqlens_i64.is_contiguous():
+        cu_seqlens_i64 = cu_seqlens_i64.contiguous()
+
+    if output_state is None:
+        output_state = torch.empty(
+            (inputs.num_seqs, inputs.num_o_heads, q.size(2), q.size(2)),
+            dtype=torch.float32,
+            device=q.device,
+        )
+
+    workspace_size = get_device_sm_count(q.device) * 128
+    workspace_buffer = _get_cache_buf("sm90_gdn_prefill_workspace", workspace_size, q.device)
+
+    cula_cuda.gdn_fwd_prefill_sm90(
+        output,
+        output_state,
+        q,
+        k,
+        v,
+        cu_seqlens_i64,
+        initial_state,
+        inputs.g,
+        inputs.beta,
+        inputs.scale,
+        workspace_buffer,
+    )
+
+
+def _launch_sm90_gdn_prefill_dsl(inputs: _GDNPrefillInputs) -> None:
+    from cula.gdn.sm90_dsl_fwd import launch_sm90_gdn_prefill_dsl
+
+    launch_sm90_gdn_prefill_dsl(inputs)
+
+
 def chunk_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -509,7 +594,18 @@ def chunk_gated_delta_rule(
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
-    _launch_sm100_gdn_prefill(inputs)
+    props = torch.cuda.get_device_properties(inputs.q.device)
+    major, minor = props.major, props.minor
+    if major == 9 and minor == 0:
+        backend = get_sm90_gdn_prefill_backend()
+        if backend == _SM90_BACKEND_DSL:
+            _launch_sm90_gdn_prefill_dsl(inputs)
+        else:
+            _launch_sm90_gdn_prefill(inputs)
+    elif major == 10 and minor in (0, 3):
+        _launch_sm100_gdn_prefill(inputs)
+    else:
+        raise RuntimeError(f"GDN prefill supports SM90 and SM100/SM103, got compute capability sm_{major}{minor}.")
     if output_final_state:
         assert inputs.output_state is not None
         return inputs.output, inputs.output_state

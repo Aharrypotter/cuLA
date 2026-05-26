@@ -128,6 +128,7 @@ def get_arch_flags():
     if not DISABLE_SM90:
         arch_flags.extend(["-gencode", "arch=compute_90a,code=sm_90a"])
         arch_flags.extend(["-DCULA_SM90A_ENABLED"])
+        arch_flags.extend(["-DFLAT_SM90A_ENABLED"])
     return arch_flags
 
 
@@ -159,6 +160,8 @@ if not DISABLE_SM90:
     cuda_sources.extend(
         [
             "csrc/api/kda_sm90.cu",
+            "csrc/api/gdn_sm90.cu",
+            "csrc/gdn/sm90/gdn_fwd_sm90.cu",
             "csrc/kda/sm90/kda_fwd_sm90.cu",
             "csrc/kda/sm90/kda_fwd_sm90_safe_gate.cu",
         ]
@@ -194,6 +197,7 @@ ext_modules.append(
         },
         include_dirs=[
             Path(this_dir) / "csrc",
+            Path(this_dir) / "3rdparty" / "flashinfer" / "include",
             Path(this_dir) / "csrc" / "kerutils" / "include",
             Path(this_dir) / "csrc" / "cutlass" / "include",
             Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
