@@ -201,7 +201,7 @@ class _SM90GDNPrefillReferenceKernel:
         new_v_tile = smem.allocate_tensor(cutlass.BFloat16, qkv_tile_layout, 16)
         mma_scratch_tile = smem.allocate_tensor(cutlass.BFloat16, qkv_tile_layout, 16)
         o_acc_tile = smem.allocate_tensor(cutlass.BFloat16, qkv_tile_layout, 16)
-        alpha_tile = smem.allocate_tensor(cutlass.Float32, alpha_tile_layout, 16)
+        alpha_cumsum_log_tile = smem.allocate_tensor(cutlass.Float32, alpha_tile_layout, 16)
         beta_tile = smem.allocate_tensor(cutlass.Float32, alpha_tile_layout, 16)
         alpha_cumprod_tile = smem.allocate_tensor(cutlass.Float32, alpha_tile_layout, 16)
         alpha_decay_tile = smem.allocate_tensor(cutlass.Float32, alpha_tile_layout, 16)
@@ -212,7 +212,10 @@ class _SM90GDNPrefillReferenceKernel:
         # keeping O accumulation independent from the residual V lifetime.
         inv_kk_beta_bf16_tile = mma_scratch_tile
 
-        self._kv_load_reference(initial_state, kv_state_tile, seq_idx, o_head_idx, v_col)
+        if cutlass.const_expr(self.use_initial_state):
+            self._kv_load_reference(initial_state, kv_state_tile, seq_idx, o_head_idx, v_col)
+        else:
+            self._kv_clear_reference(kv_state_tile, v_col)
 
         cute.arch.barrier()
 
@@ -221,16 +224,10 @@ class _SM90GDNPrefillReferenceKernel:
         seq_len = seq_end - seq_start
         num_blocks = (seq_len + self.chunk_size - 1) // self.chunk_size
 
-        for blk_idx in cutlass.range(0, num_blocks, unroll=0):
-            chunk_start = seq_start + blk_idx * self.chunk_size
-            valid_tokens = seq_len - blk_idx * self.chunk_size
+        if num_blocks > 0:
+            valid_tokens = seq_len
             if valid_tokens > self.chunk_size:
                 valid_tokens = self.chunk_size
-
-            if cutlass.const_expr(self.use_initial_state):
-                has_prior_state = True
-            else:
-                has_prior_state = blk_idx != 0
 
             self._compute_one_block_reference(
                 q,
@@ -250,13 +247,52 @@ class _SM90GDNPrefillReferenceKernel:
                 o_acc_tile,
                 mma_scratch_tile,
                 new_v_tile,
-                alpha_tile,
+                alpha_cumsum_log_tile,
+                beta_tile,
+                alpha_cumprod_tile,
+                alpha_decay_tile,
+                seq_start,
+                valid_tokens,
+                self.use_initial_state,
+                q_head_idx,
+                k_head_idx,
+                v_head_idx,
+                o_head_idx,
+                tidx,
+                v_col,
+            )
+
+        for blk_idx in cutlass.range(1, num_blocks, unroll=0):
+            chunk_start = seq_start + blk_idx * self.chunk_size
+            valid_tokens = seq_len - blk_idx * self.chunk_size
+            if valid_tokens > self.chunk_size:
+                valid_tokens = self.chunk_size
+
+            self._compute_one_block_reference(
+                q,
+                k,
+                v,
+                alpha,
+                beta,
+                output,
+                q_tile,
+                k_tile,
+                v_tile,
+                kv_state_tile,
+                qk_tile,
+                kk_tile,
+                inv_kk_beta_tile,
+                inv_kk_beta_bf16_tile,
+                o_acc_tile,
+                mma_scratch_tile,
+                new_v_tile,
+                alpha_cumsum_log_tile,
                 beta_tile,
                 alpha_cumprod_tile,
                 alpha_decay_tile,
                 chunk_start,
                 valid_tokens,
-                has_prior_state,
+                True,
                 q_head_idx,
                 k_head_idx,
                 v_head_idx,
@@ -278,10 +314,17 @@ class _SM90GDNPrefillReferenceKernel:
     ):
         if v_col < self.head_size:
             for k_row in cutlass.range(self.head_size, unroll=1):
-                if cutlass.const_expr(self.use_initial_state):
-                    kv_state_tile[v_col, k_row] = cutlass.Float32(initial_state[seq_idx, o_head_idx, k_row, v_col])
-                else:
-                    kv_state_tile[v_col, k_row] = cutlass.Float32(0.0)
+                kv_state_tile[v_col, k_row] = cutlass.Float32(initial_state[seq_idx, o_head_idx, k_row, v_col])
+
+    @cute.jit
+    def _kv_clear_reference(
+        self,
+        kv_state_tile: cute.Tensor,
+        v_col,
+    ):
+        if v_col < self.head_size:
+            for k_row in cutlass.range(self.head_size, unroll=1):
+                kv_state_tile[v_col, k_row] = cutlass.Float32(0.0)
 
     @cute.jit
     def _kv_store_reference(
@@ -318,13 +361,13 @@ class _SM90GDNPrefillReferenceKernel:
         o_acc_tile: cute.Tensor,
         mma_scratch_tile: cute.Tensor,
         new_v_tile: cute.Tensor,
-        alpha_tile: cute.Tensor,
+        alpha_cumsum_log_tile: cute.Tensor,
         beta_tile: cute.Tensor,
         alpha_cumprod_tile: cute.Tensor,
         alpha_decay_tile: cute.Tensor,
         chunk_start,
         valid_tokens,
-        has_prior_state,
+        has_prior_state: cutlass.Constexpr[bool],
         q_head_idx,
         k_head_idx,
         v_head_idx,
@@ -350,7 +393,7 @@ class _SM90GDNPrefillReferenceKernel:
         self._load_alpha_beta_reference(
             alpha,
             beta,
-            alpha_tile,
+            alpha_cumsum_log_tile,
             beta_tile,
             chunk_start,
             valid_tokens,
@@ -360,7 +403,12 @@ class _SM90GDNPrefillReferenceKernel:
 
         cute.arch.barrier()
 
-        self._stage_alpha_preprocess_reference(alpha_tile, alpha_cumprod_tile, alpha_decay_tile, tidx)
+        self._stage_alpha_preprocess_reference(
+            alpha_cumsum_log_tile,
+            alpha_cumprod_tile,
+            alpha_decay_tile,
+            tidx,
+        )
 
         self._compute_aux_loop_body_reference(
             q_tile,
@@ -369,7 +417,7 @@ class _SM90GDNPrefillReferenceKernel:
             kk_tile,
             inv_kk_beta_tile,
             inv_kk_beta_bf16_tile,
-            alpha_cumprod_tile,
+            alpha_cumsum_log_tile,
             beta_tile,
             valid_tokens,
             tidx,
@@ -428,7 +476,7 @@ class _SM90GDNPrefillReferenceKernel:
         self,
         alpha: cute.Tensor,
         beta: cute.Tensor,
-        alpha_tile: cute.Tensor,
+        alpha_cumsum_log_tile: cute.Tensor,
         beta_tile: cute.Tensor,
         chunk_start,
         valid_tokens,
@@ -438,40 +486,47 @@ class _SM90GDNPrefillReferenceKernel:
         if tidx < self.chunk_size:
             token_idx = chunk_start + tidx
             if tidx < valid_tokens:
-                alpha_tile[tidx] = cutlass.Float32(alpha[token_idx, o_head_idx])
+                alpha_cumsum_log_tile[tidx] = cutlass.Float32(alpha[token_idx, o_head_idx])
                 beta_tile[tidx] = cutlass.Float32(beta[token_idx, o_head_idx])
             else:
-                alpha_tile[tidx] = cutlass.Float32(1.0)
+                alpha_cumsum_log_tile[tidx] = cutlass.Float32(1.0)
                 beta_tile[tidx] = cutlass.Float32(0.0)
 
     @cute.jit
     def _stage_alpha_preprocess_reference(
         self,
-        alpha_tile: cute.Tensor,
+        alpha_cumsum_log_tile: cute.Tensor,
         alpha_cumprod_tile: cute.Tensor,
         alpha_decay_tile: cute.Tensor,
         tidx,
     ):
         if tidx < self.chunk_size:
-            alpha_cumprod_tile[tidx] = alpha_tile[tidx]
+            alpha_cumsum_log_tile[tidx] = cute.math.log2(
+                alpha_cumsum_log_tile[tidx] + cutlass.Float32(1e-10),
+                fastmath=True,
+            )
 
         cute.arch.barrier()
 
         for scan_step in cutlass.range_constexpr(6):
             offset = 1 << scan_step
-            prefix_factor = cutlass.Float32(1.0)
+            prefix_sum = cutlass.Float32(0.0)
             if tidx < self.chunk_size and tidx >= offset:
-                prefix_factor = alpha_cumprod_tile[tidx - offset]
+                prefix_sum = alpha_cumsum_log_tile[tidx - offset]
 
             cute.arch.barrier()
 
             if tidx < self.chunk_size and tidx >= offset:
-                alpha_cumprod_tile[tidx] = alpha_cumprod_tile[tidx] * prefix_factor
+                alpha_cumsum_log_tile[tidx] = alpha_cumsum_log_tile[tidx] + prefix_sum
 
             cute.arch.barrier()
 
         if tidx < self.chunk_size:
-            alpha_decay_tile[tidx] = alpha_cumprod_tile[self.chunk_size - 1] / alpha_cumprod_tile[tidx]
+            alpha_cumprod_tile[tidx] = cute.math.exp2(alpha_cumsum_log_tile[tidx], fastmath=True)
+            alpha_decay_tile[tidx] = cute.math.exp2(
+                alpha_cumsum_log_tile[self.chunk_size - 1] - alpha_cumsum_log_tile[tidx],
+                fastmath=True,
+            )
 
         cute.arch.barrier()
 
@@ -944,7 +999,7 @@ class _SM90GDNPrefillReferenceKernel:
         kk_tile: cute.Tensor,
         inv_kk_beta_tile: cute.Tensor,
         inv_kk_beta_bf16_tile: cute.Tensor,
-        alpha_cumprod_tile: cute.Tensor,
+        alpha_cumsum_log_tile: cute.Tensor,
         beta_tile: cute.Tensor,
         valid_tokens,
         tidx,
@@ -956,7 +1011,7 @@ class _SM90GDNPrefillReferenceKernel:
         self._stage_qk_and_kk_epi_reference(
             qk_tile,
             kk_tile,
-            alpha_cumprod_tile,
+            alpha_cumsum_log_tile,
             beta_tile,
             valid_tokens,
             tidx,
@@ -1034,7 +1089,7 @@ class _SM90GDNPrefillReferenceKernel:
         alpha_decay_tile: cute.Tensor,
         chunk_start,
         valid_tokens,
-        has_prior_state,
+        has_prior_state: cutlass.Constexpr[bool],
         o_head_idx,
         v_col,
     ):
@@ -1100,9 +1155,9 @@ class _SM90GDNPrefillReferenceKernel:
         v_residual_tile: cute.Tensor,
         alpha_cumprod_tile: cute.Tensor,
         valid_tokens,
-        has_prior_state,
+        has_prior_state: cutlass.Constexpr[bool],
     ):
-        if has_prior_state:
+        if cutlass.const_expr(has_prior_state):
             self._stage_sk_mma_reference(
                 k_tile,
                 kv_state_tile,
@@ -1142,10 +1197,10 @@ class _SM90GDNPrefillReferenceKernel:
         o_acc_tile: cute.Tensor,
         alpha_cumprod_tile: cute.Tensor,
         valid_tokens,
-        has_prior_state,
+        has_prior_state: cutlass.Constexpr[bool],
         v_col,
     ):
-        if has_prior_state:
+        if cutlass.const_expr(has_prior_state):
             self._stage_o1_mma_reference(q_tile, kv_state_tile, kv_operand_scratch_tile, o_acc_tile)
         else:
             self._stage_o1_zero_reference(o_acc_tile, v_col)
@@ -1163,7 +1218,7 @@ class _SM90GDNPrefillReferenceKernel:
         qk_bf16_scratch_tile: cute.Tensor,
         new_v_tile: cute.Tensor,
         output_tile: cute.Tensor,
-        has_prior_state,
+        has_prior_state: cutlass.Constexpr[bool],
         v_col,
     ):
         self._stage_qk_for_o2_reference(qk_tile, qk_bf16_scratch_tile, v_col)
@@ -1483,7 +1538,7 @@ class _SM90GDNPrefillReferenceKernel:
         qk_bf16_scratch_tile: cute.Tensor,
         new_v_tile: cute.Tensor,
         output_tile: cute.Tensor,
-        has_prior_state,
+        has_prior_state: cutlass.Constexpr[bool],
     ):
         for col_tile in cutlass.range(0, 8, unroll=0):
             col_base = col_tile * 16
@@ -1502,7 +1557,7 @@ class _SM90GDNPrefillReferenceKernel:
         qk_bf16_scratch_tile: cute.Tensor,
         output_tile: cute.Tensor,
         col_base,
-        has_prior_state,
+        has_prior_state: cutlass.Constexpr[bool],
     ):
         warp_idx = cute.arch.warp_idx() % 4
         lane_id = cute.arch.thread_idx()[0] % 32
@@ -1557,7 +1612,7 @@ class _SM90GDNPrefillReferenceKernel:
 
         for i in cutlass.range_constexpr(cute.size(t_out_coord)):
             row, col = t_out_coord[i]
-            if has_prior_state:
+            if cutlass.const_expr(has_prior_state):
                 output_tile[row_base + col, col_base + row] = cutlass.BFloat16(
                     cutlass.Float32(output_tile[row_base + col, col_base + row]) + t_out[i]
                 )
@@ -1823,19 +1878,19 @@ class _SM90GDNPrefillReferenceKernel:
         self,
         qk_tile: cute.Tensor,
         kk_tile: cute.Tensor,
-        alpha_cumprod_tile: cute.Tensor,
+        alpha_cumsum_log_tile: cute.Tensor,
         beta_tile: cute.Tensor,
         valid_tokens,
         tidx,
     ):
-        self._stage_qk_gdn_epilogue_reference(qk_tile, alpha_cumprod_tile, valid_tokens, tidx)
-        self._stage_kk_gdn_epilogue_reference(kk_tile, alpha_cumprod_tile, beta_tile, valid_tokens, tidx)
+        self._stage_qk_gdn_epilogue_reference(qk_tile, alpha_cumsum_log_tile, valid_tokens, tidx)
+        self._stage_kk_gdn_epilogue_reference(kk_tile, alpha_cumsum_log_tile, beta_tile, valid_tokens, tidx)
 
     @cute.jit
     def _stage_qk_gdn_epilogue_reference(
         self,
         qk_tile: cute.Tensor,
-        alpha_cumprod_tile: cute.Tensor,
+        alpha_cumsum_log_tile: cute.Tensor,
         valid_tokens,
         tidx,
     ):
@@ -1843,14 +1898,17 @@ class _SM90GDNPrefillReferenceKernel:
             row = tidx
             if row < valid_tokens:
                 for col in cutlass.range(0, row + 1, unroll=0):
-                    transfer = alpha_cumprod_tile[row] / alpha_cumprod_tile[col]
+                    transfer = cute.math.exp2(
+                        alpha_cumsum_log_tile[row] - alpha_cumsum_log_tile[col],
+                        fastmath=True,
+                    )
                     qk_tile[row, col] = self.scale * transfer * qk_tile[row, col]
 
     @cute.jit
     def _stage_kk_gdn_epilogue_reference(
         self,
         kk_tile: cute.Tensor,
-        alpha_cumprod_tile: cute.Tensor,
+        alpha_cumsum_log_tile: cute.Tensor,
         beta_tile: cute.Tensor,
         valid_tokens,
         tidx,
@@ -1859,7 +1917,10 @@ class _SM90GDNPrefillReferenceKernel:
             row = tidx
             if row < valid_tokens:
                 for col in cutlass.range(0, row + 1, unroll=0):
-                    transfer = alpha_cumprod_tile[row] / alpha_cumprod_tile[col]
+                    transfer = cute.math.exp2(
+                        alpha_cumsum_log_tile[row] - alpha_cumsum_log_tile[col],
+                        fastmath=True,
+                    )
                     kk_tile[row, col] = (
                         beta_tile[row] * transfer * kk_tile[row, col] if col < row else cutlass.Float32(0.0)
                     )

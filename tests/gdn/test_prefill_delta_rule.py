@@ -313,6 +313,56 @@ def test_gdn_prefill_sm90_dsl_no_initial_state_multi_chunk_matches_reference(mon
     torch.testing.assert_close(actual_state.transpose(-1, -2), expected_state, rtol=7e-2, atol=7e-2)
 
 
+@pytest.mark.skipif(not _is_sm90_device(), reason="SM90 DSL log-space alpha smoke requires Hopper")
+def test_gdn_prefill_sm90_dsl_strong_alpha_decay_matches_reference(monkeypatch):
+    torch.manual_seed(9)
+    monkeypatch.setenv("CULA_GDN_SM90_BACKEND", "dsl")
+
+    device = torch.device("cuda")
+    seq_lens = [64]
+    total_tokens = sum(seq_lens)
+    num_heads = 1
+    head_size = 128
+    q = torch.randn(total_tokens, num_heads, head_size, dtype=torch.bfloat16, device=device) * 0.2
+    k = F.normalize(
+        torch.randn(total_tokens, num_heads, head_size, dtype=torch.bfloat16, device=device),
+        p=2,
+        dim=-1,
+    )
+    v = torch.randn(total_tokens, num_heads, head_size, dtype=torch.bfloat16, device=device) * 0.1
+    g = torch.full((total_tokens, num_heads), 0.1, dtype=torch.float32, device=device)
+    beta = torch.rand(total_tokens, num_heads, dtype=torch.float32, device=device) * 0.5
+    cu_seqlens = seq_lens_to_cu_seqlens(seq_lens, device=device, dtype=torch.int64)
+    scale = 1.0 / math.sqrt(head_size)
+
+    actual, actual_state = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g=g,
+        beta=beta,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        scale=scale,
+    )
+    expected, expected_state = blockwise_delta_rule(
+        q.float(),
+        k.float(),
+        v.float(),
+        seq_lens,
+        alpha=g,
+        beta=beta,
+        block_size=64,
+        scale_factor=scale,
+        state_dtype=torch.float32,
+    )
+
+    assert torch.isfinite(actual).all()
+    assert torch.isfinite(actual_state).all()
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=7e-2, atol=7e-2)
+    torch.testing.assert_close(actual_state.transpose(-1, -2), expected_state, rtol=7e-2, atol=7e-2)
+
+
 @pytest.mark.skipif(not _is_sm90_device(), reason="SM90 DSL multi-chunk smoke requires Hopper")
 def test_gdn_prefill_sm90_dsl_multi_chunk_staged_output_matches_reference(monkeypatch):
     torch.manual_seed(4)
