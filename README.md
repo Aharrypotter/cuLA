@@ -144,6 +144,12 @@ unsupported behavior, and canonical 28-row benchmark. The
 [GDN SM90 pipeline](docs/gdn_sm90_pipeline.md) documents the kernel's thread
 roles, pipelines, and recurrent-state dataflow.
 
+The `gdn2-sm90a-comparator` branch additionally preserves the exact
+`cula.gdn2` CuTe DSL comparator source used by the unofficial
+[GDN SM90a/TIRx research release](https://github.com/Aharrypotter/gdn-sm90a-tirx-report).
+It is a source snapshot for reproducible comparison, not an upstream cuLA
+release or a replacement for the default `cula.gdn` API.
+
 ## Usage
 
 See [USAGE.md](USAGE.md) for detailed usage examples and notes.
